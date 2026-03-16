@@ -559,10 +559,9 @@ mb_slave_t * mb_slave_init (
    const mb_slave_cfg_t * cfg,
    mb_transport_t * transport)
 {
-   mb_slave_t * slave;
-
    /* Allocate and initialise slave state */
-   slave = malloc (sizeof (mb_slave_t));
+   static mb_slave_t rtu1;
+   mb_slave_t * slave = &rtu1;
    CC_ASSERT (slave != NULL);
 
    slave->iomap = cfg->iomap;
