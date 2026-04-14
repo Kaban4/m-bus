@@ -18,6 +18,7 @@
 #include "mb_crc.h"
 #include "mbal_rtu.h"
 #include "options.h"
+#include <stdio.h>
 
 #include "osal.h"
 #include "osal_log.h"
@@ -82,17 +83,46 @@ static void mb_t3p5_expired (void * arg)
    os_event_set (rtu->flags, FLAG_T3P5);
 }
 
-volatile uint32_t dbg_rx_hook_cnt = 0;
+volatile uint32_t dbg_rtu_last_flags = 0;
+volatile uint32_t dbg_rtu_last_crc_after_check = 0;
+volatile int32_t  dbg_rtu_last_error = 0;
 
-volatile uint32_t dbg_last_rxhook_ms = 0;
+volatile uint32_t dbg_rtu_first_read_n = 0;
+volatile uint32_t dbg_rtu_first_rx_avail_before = 0;
+volatile uint32_t dbg_rtu_first_rx_avail_after = 0;
+volatile uint32_t dbg_rtu_last_rx_frame_len = 0;
+volatile uint8_t dbg_rtu_last_rx_frame[MAX_PDU_SIZE + 1] = {0};
+
+static void dbg_rtu_last_rx_frame_reset (void)
+{
+   size_t i;
+
+   dbg_rtu_last_rx_frame_len = 0;
+   for (i = 0; i < sizeof (dbg_rtu_last_rx_frame); i++)
+   {
+      dbg_rtu_last_rx_frame[i] = 0;
+   }
+}
+
+static void dbg_rtu_last_rx_frame_append (
+   const uint8_t * buffer,
+   size_t size)
+{
+   size_t i;
+   uint32_t pos = dbg_rtu_last_rx_frame_len;
+
+   for (i = 0; i < size && pos < sizeof (dbg_rtu_last_rx_frame); i++)
+   {
+      dbg_rtu_last_rx_frame[pos++] = buffer[i];
+   }
+
+   dbg_rtu_last_rx_frame_len = pos;
+}
 
 int mb_rx_hook(void * arg, void * data)
 {
    mb_rtu_t * rtu = (mb_rtu_t *)arg;
 
-   dbg_last_rxhook_ms = osal_now_ms();;
-
-   dbg_rx_hook_cnt++;
    tracepoint (mb, rx_hook);
    
    os_event_clr (rtu->flags, FLAG_T1P5 | FLAG_T3P5);
@@ -184,29 +214,29 @@ static void mb_rtu_write (mb_rtu_t * rtu, const void * buffer, size_t size)
 
 static size_t mb_rtu_read(mb_rtu_t *rtu, void *buffer, size_t size)
 {
-    ssize_t navail, nread;
+   ssize_t navail, nread;
 
-    os_event_clr(rtu->flags, FLAG_RX_AVAIL);
+   os_event_clr(rtu->flags, FLAG_RX_AVAIL);
 
-    navail = os_rtu_rx_avail(rtu->fd);
-      if (navail <= 0) {
-         return 0;
-      }
+   navail = os_rtu_rx_avail(rtu->fd);
+   if (navail <= 0) {
+      return 0;
+   }
 
-      if ((size_t)navail > size) {
-         /* Still data pending after we read only `size` bytes */
-         os_event_set(rtu->flags, FLAG_RX_AVAIL);
-         navail = (ssize_t)size;
-      }
+   if ((size_t)navail > size) {
+      /* Still data pending after we read only `size` bytes */
+      os_event_set(rtu->flags, FLAG_RX_AVAIL);
+      navail = (ssize_t)size;
+   }
 
-      nread = os_rtu_read(rtu->fd, buffer, (size_t)navail);
+   nread = os_rtu_read(rtu->fd, buffer, (size_t)navail);
 
-      /* IMPORTANT: if data is still pending after read, raise RX_AVAIL again */
-      if (os_rtu_rx_avail(rtu->fd) > 0) {
-         os_event_set(rtu->flags, FLAG_RX_AVAIL);
-      }
+   /* IMPORTANT: if data is still pending after read, raise RX_AVAIL again */
+   if (os_rtu_rx_avail(rtu->fd) > 0) {
+      os_event_set(rtu->flags, FLAG_RX_AVAIL);
+   }
 
-      return (nread > 0) ? (size_t)nread : 0;
+   return (nread > 0) ? (size_t)nread : 0;
 }
 
 static void mb_rtu_tx (
@@ -318,11 +348,15 @@ static int mb_rtu_rx(
    size_t count   = 0;
    uint32_t flags;
    crc_t crc;
-   uint8_t slave_rx;
+   uint8_t slave_rx = 0;
    uint8_t * p = transaction->data;
    int error;
 
-   os_event_clr(rtu->flags, FLAG_T1P5 | FLAG_T3P5 | FLAG_RX_AVAIL);
+   dbg_rtu_last_crc_after_check = 0;
+   dbg_rtu_first_read_n = 0;
+   dbg_rtu_first_rx_avail_before = 0;
+   dbg_rtu_first_rx_avail_after = 0;
+   dbg_rtu_last_rx_frame_reset ();
 
    tracepoint (mb, rx_trace, 1);
 
@@ -331,9 +365,8 @@ static int mb_rtu_rx(
    {
       int timedout;
 
-      uint32_t mask = FLAG_RX_AVAIL;   // RX_AVAIL only
-      timedout = os_event_wait(rtu->flags, mask, &flags, tmo ? tmo : OS_WAIT_FOREVER);
-
+      timedout =
+         os_event_wait (rtu->flags, FLAG_T1P5 | FLAG_RX_AVAIL, &flags, tmo);
       if (timedout)
       {
          tracepoint (mb, rx_trace, 2);
@@ -342,16 +375,20 @@ static int mb_rtu_rx(
    }
    else
    {
-      uint32_t mask = FLAG_RX_AVAIL;   // RX_AVAIL only
       os_event_wait (
          rtu->flags,
-         mask,
+         FLAG_T1P5 | FLAG_RX_AVAIL,
          &flags,
          OS_WAIT_FOREVER);
    }
 
    /* Get slave ID */
-   mb_rtu_read (rtu, &slave_rx, 1);
+   dbg_rtu_first_rx_avail_before = (uint32_t)os_rtu_rx_avail(rtu->fd);
+   dbg_rtu_first_read_n = (uint32_t)mb_rtu_read(rtu, &slave_rx, 1);
+   dbg_rtu_first_rx_avail_after = (uint32_t)os_rtu_rx_avail(rtu->fd);
+   printf("Slave_id: %u (bytes: %u), available to read after: %u, before: %u\n", slave_rx, dbg_rtu_first_read_n, dbg_rtu_first_rx_avail_after, dbg_rtu_first_rx_avail_before);
+   dbg_rtu_last_rx_frame_append (&slave_rx, (size_t)dbg_rtu_first_read_n);
+
    crc = mb_crc (&slave_rx, 1, 0xFFFF);
 
    /* Get remainder of message (until T1P5 expires) */
@@ -362,20 +399,17 @@ static int mb_rtu_rx(
 
       if (flags & FLAG_RX_AVAIL) {
          nread = mb_rtu_read(rtu, p, MAX_PDU_SIZE - count);
+         printf("Read %u bytes in body\n", (uint32_t)nread);
+         dbg_rtu_last_rx_frame_append (p, nread);
          p += nread;
          count += nread;
       }
    } while ((flags & FLAG_T1P5) == 0);
 
-   while (os_rtu_rx_avail(rtu->fd) > 0 && count < MAX_PDU_SIZE) {
-      size_t n = mb_rtu_read(rtu, p, MAX_PDU_SIZE - count);
-      if (!n) break;
-      p += n;
-      count += n;
-   }
-
    /* Verify message */
    crc = mb_crc (transaction->data, (uint8_t)count, crc);
+   
+   dbg_rtu_last_crc_after_check = crc;
    if (crc != 0)
    {
       error    = ECRC_FAIL;
@@ -393,36 +427,23 @@ static int mb_rtu_rx(
    rtu->broadcast = (slave_rx == 0);
 
    /* Wait for end of frame (until T3P5 expires) */
-   uint32_t t3_tmo_ms = 20u;
    do
    {
-      int to = os_event_wait(
+      os_event_wait (
          rtu->flags,
          FLAG_T3P5 | FLAG_RX_AVAIL,
          &flags,
-         t3_tmo_ms
-      );
-
-      if (to) {
-         /* If timer/IRQ is missed — do not hang */
-         flags |= FLAG_T3P5;
-      }
-
-      if (flags & FLAG_RX_AVAIL) {
-         error = EFRAME_NOK;
+         OS_WAIT_FOREVER);
+      if (flags & FLAG_RX_AVAIL)
+      {
+         error    = EFRAME_NOK;
          frame_ok = false;
 
-         uint8_t tmp2[32];
-         while (os_rtu_rx_avail(rtu->fd) > 0) {
-            os_rtu_read(rtu->fd, tmp2, sizeof(tmp2));
-         }
+         /* Need to process extra characters. Stick them at the end of
+            the current message but don't increment counter */
+         mb_rtu_read (rtu, p, MAX_PDU_SIZE - count);
       }
    } while ((flags & FLAG_T3P5) == 0);
-
-   uint8_t tmp[32];
-   while (os_rtu_rx_avail(rtu->fd) > 0) {
-      os_rtu_read(rtu->fd, tmp, sizeof(tmp));
-   }
 
    os_event_clr (rtu->flags, FLAG_T1P5 | FLAG_T3P5 | FLAG_RX_AVAIL);
 
