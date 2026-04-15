@@ -83,42 +83,6 @@ static void mb_t3p5_expired (void * arg)
    os_event_set (rtu->flags, FLAG_T3P5);
 }
 
-volatile uint32_t dbg_rtu_last_flags = 0;
-volatile uint32_t dbg_rtu_last_crc_after_check = 0;
-volatile int32_t  dbg_rtu_last_error = 0;
-
-volatile uint32_t dbg_rtu_first_read_n = 0;
-volatile uint32_t dbg_rtu_first_rx_avail_before = 0;
-volatile uint32_t dbg_rtu_first_rx_avail_after = 0;
-volatile uint32_t dbg_rtu_last_rx_frame_len = 0;
-volatile uint8_t dbg_rtu_last_rx_frame[MAX_PDU_SIZE + 1] = {0};
-
-static void dbg_rtu_last_rx_frame_reset (void)
-{
-   size_t i;
-
-   dbg_rtu_last_rx_frame_len = 0;
-   for (i = 0; i < sizeof (dbg_rtu_last_rx_frame); i++)
-   {
-      dbg_rtu_last_rx_frame[i] = 0;
-   }
-}
-
-static void dbg_rtu_last_rx_frame_append (
-   const uint8_t * buffer,
-   size_t size)
-{
-   size_t i;
-   uint32_t pos = dbg_rtu_last_rx_frame_len;
-
-   for (i = 0; i < size && pos < sizeof (dbg_rtu_last_rx_frame); i++)
-   {
-      dbg_rtu_last_rx_frame[pos++] = buffer[i];
-   }
-
-   dbg_rtu_last_rx_frame_len = pos;
-}
-
 int mb_rx_hook(void * arg, void * data)
 {
    mb_rtu_t * rtu = (mb_rtu_t *)arg;
@@ -352,12 +316,6 @@ static int mb_rtu_rx(
    uint8_t * p = transaction->data;
    int error;
 
-   dbg_rtu_last_crc_after_check = 0;
-   dbg_rtu_first_read_n = 0;
-   dbg_rtu_first_rx_avail_before = 0;
-   dbg_rtu_first_rx_avail_after = 0;
-   dbg_rtu_last_rx_frame_reset ();
-
    tracepoint (mb, rx_trace, 1);
 
    /* Wait for first character */
@@ -383,12 +341,7 @@ static int mb_rtu_rx(
    }
 
    /* Get slave ID */
-   dbg_rtu_first_rx_avail_before = (uint32_t)os_rtu_rx_avail(rtu->fd);
-   dbg_rtu_first_read_n = (uint32_t)mb_rtu_read(rtu, &slave_rx, 1);
-   dbg_rtu_first_rx_avail_after = (uint32_t)os_rtu_rx_avail(rtu->fd);
-   printf("Slave_id: %u (bytes: %u), available to read after: %u, before: %u\n", slave_rx, dbg_rtu_first_read_n, dbg_rtu_first_rx_avail_after, dbg_rtu_first_rx_avail_before);
-   dbg_rtu_last_rx_frame_append (&slave_rx, (size_t)dbg_rtu_first_read_n);
-
+   mb_rtu_read(rtu, &slave_rx, 1);
    crc = mb_crc (&slave_rx, 1, 0xFFFF);
 
    /* Get remainder of message (until T1P5 expires) */
@@ -399,8 +352,6 @@ static int mb_rtu_rx(
 
       if (flags & FLAG_RX_AVAIL) {
          nread = mb_rtu_read(rtu, p, MAX_PDU_SIZE - count);
-         printf("Read %u bytes in body\n", (uint32_t)nread);
-         dbg_rtu_last_rx_frame_append (p, nread);
          p += nread;
          count += nread;
       }
@@ -408,8 +359,7 @@ static int mb_rtu_rx(
 
    /* Verify message */
    crc = mb_crc (transaction->data, (uint8_t)count, crc);
-   
-   dbg_rtu_last_crc_after_check = crc;
+
    if (crc != 0)
    {
       error    = ECRC_FAIL;
