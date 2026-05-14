@@ -1,7 +1,7 @@
 #pragma once
 
 #ifndef MB_TIM_FALLBACK_CORE_HZ
-#define MB_TIM_FALLBACK_CORE_HZ 16000000u
+#define MB_TIM_FALLBACK_CORE_HZ 150000000u
 #endif
 
 #ifndef MB_TIM_MAX
